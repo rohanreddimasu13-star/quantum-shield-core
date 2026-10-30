@@ -1,0 +1,47 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev \
+            libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev bubblewrap
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Shell script syntax
+        run: |
+          for script in scripts/test-early-response.sh scripts/test-local-tls.sh scripts/test-cert-hot-reload.sh scripts/test-compose-local-apply.sh scripts/test-security-modules.sh scripts/test-sandbox-run.sh scripts/validate-release-candidate.sh; do
+            bash -n "$script"
+          done
+      - name: Test all targets and optional desktop features
+        run: cargo test --all-targets --all-features
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build and exercise security module fixtures
+        run: |
+          cargo build --bin qsctl
+          ./scripts/test-security-modules.sh
+      - name: Exercise Linux Software Shield sandbox
+        run: ./scripts/test-sandbox-run.sh
+      - name: Check desktop GUI
+        run: cargo check --features desktop --bin qs-desktop
+      - name: Release CLI build
+        run: cargo build --release --bin qsctl
+      - name: Release desktop build
+        run: cargo build --release --features desktop --bin qs-desktop

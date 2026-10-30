@@ -1,0 +1,16 @@
+# Quantum Shield config schema v1.
+# This sample is for local HTTP engine testing only; it cannot configure public HTTPS yet.
+# The hostname is used only in the local Host-routing test; DNS is not checked.
+
+schema_version = 1
+
+[[sites]]
+id = "demo-site"
+domain = "app.example.com"
+upstream = "http://127.0.0.1:3000"
+
+# Docker Compose example (only when Quantum Shield shares the same private Docker network):
+# [[sites]]
+# id = "container-app"
+# domain = "container.example.com"
+# upstream = "http://web:3000"

@@ -1,0 +1,32 @@
+/target/
+.env
+.env.*
+!.env.example
+config.local.toml
+*.log
+.DS_Store
+
+# Generated private build contexts and deployment overlays
+.quantum-shield-*/
+compose.quantum-shield-*.yaml
+/backup-*/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+!/.env.template
+
+# Keep local source backups out of Git
+*.backup-*
+
+# Local secrets and machine-specific release artifacts
+/certs/
+/config.toml
+/dist/
+# Local recovery copies of active proxy source
+/src/proxy.rs.broken-master1-*
+/src/proxy.rs.current
+/src/proxy.rs.current-*
+
+# Accidental local terminal redirect
+/et -u

@@ -1,0 +1,63 @@
+[package]
+name = "quantum-shield"
+version = "1.0.0-rc.2"
+edition = "2021"
+rust-version = "1.92"
+description = "Quantum Shield website, application and repository security toolkit"
+license-file = "LICENSE"
+default-run = "qsctl"
+
+[[bin]]
+name = "qsctl"
+path = "src/main.rs"
+
+[features]
+default = []
+mTls = []
+dlp = ["dep:regex", "dep:flate2"]
+circuit_breaker = []
+# Optional content gate for JSON/form request bodies. Opaque/binary bodies are not rewritten.
+body_gate = []
+prometheus = ["dep:prometheus"]
+
+[dependencies]
+aws-lc-rs = "=1.18.2"
+zeroize = "=1.9.1"
+argon2 = "=0.5.3"
+rpassword = "=7.4.0"
+eframe = { version = "=0.34.3", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+anyhow = "1.0"
+regex = { version = "1", optional = true }
+flate2 = { version = "=1.1.10", optional = true }
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util", "sync"] }
+toml = "0.8"
+url = "2.5"
+rustls = { version = "0.23.46", features = ["aws_lc_rs", "prefer-post-quantum", "tls12"] }
+rustls-pki-types = { version = "1.15", features = ["std"] }
+tokio-rustls = "0.26.6"
+base64 = "0.22"
+rustls-acme = { version = "=0.15.4", features = ["tokio", "aws-lc-rs", "tower"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower-service = "0.3.3"
+tls-hot-reload = { version = "=0.4.0", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2"
+prometheus = { version = "0.14", optional = true }
+zentinel-modsec = "=0.5.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+rcgen = "0.13.2"
