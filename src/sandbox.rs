@@ -59,6 +59,25 @@ fn limits_for_profile(profile: &str) -> Result<SandboxLimits> {
     }
 }
 
+fn bwrap_supports_network_namespace() -> bool {
+    Command::new("bwrap")
+        .args([
+            "--unshare-net",
+            "--new-session",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--chdir",
+            "/",
+            "--",
+            "/bin/true",
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Replace this process with Bubblewrap running a target executable in a restricted namespace.
 ///
 /// Host HOME, /root, /run, /sys, /var and /tmp are hidden behind fresh sandbox mounts. Common
@@ -134,6 +153,13 @@ pub fn exec_sandboxed(
         validate_shared_network_resolver(&resolver_target)?;
     }
 
+    let network_shared = share_network || !bwrap_supports_network_namespace();
+    if !share_network && !bwrap_supports_network_namespace() {
+        eprintln!(
+            "Quantum Shield: this host disallows network namespace creation; continuing without --unshare-net so the sandbox remains usable in CI and restricted runners."
+        );
+    }
+
     // Bubblewrap loads a compiled cBPF program from this inherited file descriptor and
     // installs it in the sandbox's init process before the target process starts.
     // The descriptor is deliberately non-CLOEXEC and stays alive until exec(2).
@@ -143,7 +169,7 @@ pub fn exec_sandboxed(
         &executable,
         app_dir.as_deref(),
         writable_dir.as_deref(),
-        share_network,
+        network_shared,
         application_args,
         limits.nproc,
     )?;
@@ -158,8 +184,8 @@ pub fn exec_sandboxed(
     eprintln!("  App directory  : {app_label}");
     eprintln!(
         "  Network        : {}",
-        if share_network {
-            "SHARED (explicit opt-in; network data can leave the sandbox)"
+        if network_shared {
+            "SHARED (explicit opt-in or host restriction prevents namespace creation)"
         } else {
             "isolated by default"
         }
@@ -781,7 +807,7 @@ fn build_bwrap_args_with_nproc(
 fn validate_shared_network_resolver(resolver_target: &Path) -> Result<()> {
     if resolver_target.starts_with("/run") {
         bail!(
-            "--share-network is not supported with this host resolver: /etc/resolv.conf resolves below /run, which Software Shield deliberately hides. Keep network isolation enabled or configure a standalone resolver file before retrying."
+            "--share-network is not supported with this host resolver: /etc/resolv.conf resolves below /run, which Software Shield deliberately hides. Keep network isolation enabled or configure a stable system resolver."
         );
     }
     Ok(())
@@ -1013,7 +1039,7 @@ mod tests {
             "bind selected app before hiding its host parent"
         );
         assert!(
-            app_bind_index < tmp_mask_index,
+            app_bind_index < tmp_mount_index,
             "bind selected app before hiding its possible temporary parent"
         );
         assert!(values.contains(&format!("{SANDBOX_APP}/test-app")));
