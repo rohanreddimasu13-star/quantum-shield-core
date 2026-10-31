@@ -4,6 +4,7 @@
 //! passthrough, strict per-application syscall allowlists and language/runtime-specific profiles
 //! remain separate work. A conservative seccomp denylist is applied; network access is denied by default.
 
+use crate::sandbox_policy::{SandboxNetworkMode, SandboxNetworkReport};
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::ffi::{CString, OsString};
@@ -13,7 +14,9 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const SANDBOX_ROOT: &str = "/qs";
 const SANDBOX_APP: &str = "/qs/app";
@@ -59,11 +62,48 @@ fn limits_for_profile(profile: &str) -> Result<SandboxLimits> {
     }
 }
 
-fn bwrap_supports_network_namespace() -> bool {
-    Command::new("bwrap")
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkNamespaceProbe {
+    Supported,
+    CapabilityUnavailable(String),
+    Failed(String),
+}
+
+/// Only this specific Bubblewrap diagnostic is treated as a capability limitation.
+/// A generic EPERM / "Operation not permitted" is deliberately NOT sufficient.
+fn classify_network_namespace_probe(success: bool, stderr: &str) -> NetworkNamespaceProbe {
+    if success {
+        return NetworkNamespaceProbe::Supported;
+    }
+
+    let diagnostic = stderr.trim();
+    let lower = diagnostic.to_ascii_lowercase();
+
+    if lower.contains("no permissions to create a new namespace")
+        && lower.contains("non-privileged user namespaces")
+    {
+        return NetworkNamespaceProbe::CapabilityUnavailable(diagnostic.to_owned());
+    }
+
+    NetworkNamespaceProbe::Failed(if diagnostic.is_empty() {
+        "Bubblewrap network namespace probe failed without a diagnostic".to_owned()
+    } else {
+        diagnostic.to_owned()
+    })
+}
+
+fn probe_network_namespace() -> Result<NetworkNamespaceProbe> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut child = Command::new("bwrap")
+        .args(["--unshare-net", "--new-session"])
+        .args(
+            ["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64"]
+                .iter()
+                .filter(|root| Path::new(root).exists())
+                .flat_map(|root| ["--ro-bind", *root, *root]),
+        )
         .args([
-            "--unshare-net",
-            "--new-session",
             "--proc",
             "/proc",
             "--dev",
@@ -73,9 +113,88 @@ fn bwrap_supports_network_namespace() -> bool {
             "--",
             "/bin/true",
         ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not execute Bubblewrap network namespace capability probe")?;
+
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .context("failed waiting for Bubblewrap capability probe")?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .context("failed collecting Bubblewrap capability probe output")?;
+            return Ok(classify_network_namespace_probe(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+
+        if started.elapsed() >= PROBE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(NetworkNamespaceProbe::Failed(
+                "Bubblewrap network namespace capability probe timed out after 5 seconds"
+                    .to_owned(),
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Resolve the requested mode into an explicit requested/effective policy report.
+fn resolve_linux_network_policy(mode: SandboxNetworkMode) -> Result<SandboxNetworkReport> {
+    match mode {
+        SandboxNetworkMode::Shared => {
+            eprintln!("Quantum Shield: network mode explicitly set to shared.");
+            Ok(SandboxNetworkReport::new(
+                mode,
+                SandboxNetworkMode::Shared,
+                None,
+            ))
+        }
+        SandboxNetworkMode::Isolated => match probe_network_namespace()? {
+            NetworkNamespaceProbe::Supported => Ok(SandboxNetworkReport::new(
+                mode,
+                SandboxNetworkMode::Isolated,
+                None,
+            )),
+            NetworkNamespaceProbe::CapabilityUnavailable(reason)
+            | NetworkNamespaceProbe::Failed(reason) => {
+                bail!(
+                    "network isolation is required, but Bubblewrap could not establish a network namespace: {reason}"
+                )
+            }
+        },
+        SandboxNetworkMode::Automatic => match probe_network_namespace()? {
+            NetworkNamespaceProbe::Supported => Ok(SandboxNetworkReport::new(
+                mode,
+                SandboxNetworkMode::Isolated,
+                None,
+            )),
+            NetworkNamespaceProbe::CapabilityUnavailable(reason) => {
+                eprintln!(
+                    "WARNING: Quantum Shield automatic network mode is falling back to shared host networking because this host reports that unprivileged user namespaces are unavailable: {reason}"
+                );
+                Ok(SandboxNetworkReport::new(
+                    mode,
+                    SandboxNetworkMode::Shared,
+                    Some(reason),
+                ))
+            }
+            NetworkNamespaceProbe::Failed(reason) => {
+                bail!(
+                    "automatic network mode refused fallback because the Bubblewrap probe failed for an unrecognized reason: {reason}"
+                )
+            }
+        },
+    }
 }
 
 /// Replace this process with Bubblewrap running a target executable in a restricted namespace.
@@ -88,7 +207,7 @@ pub fn exec_sandboxed(
     executable: &Path,
     app_dir: Option<&Path>,
     writable_dir: Option<&Path>,
-    share_network: bool,
+    network_mode: SandboxNetworkMode,
     application_args: &[OsString],
     profile: &str,
 ) -> Result<()> {
@@ -146,18 +265,14 @@ pub fn exec_sandboxed(
         }
     }
 
-    if share_network {
+    let network_report = resolve_linux_network_policy(network_mode)?;
+    let network_shared = network_report.effective_mode == SandboxNetworkMode::Shared;
+
+    if network_shared {
         let resolver_target = Path::new("/etc/resolv.conf").canonicalize().context(
-            "could not resolve /etc/resolv.conf; keep network isolated until the resolver is fixed",
+            "could not resolve /etc/resolv.conf; refusing shared networking until the resolver is fixed",
         )?;
         validate_shared_network_resolver(&resolver_target)?;
-    }
-
-    let network_shared = share_network || !bwrap_supports_network_namespace();
-    if !share_network && !bwrap_supports_network_namespace() {
-        eprintln!(
-            "Quantum Shield: this host disallows network namespace creation; continuing without --unshare-net so the sandbox remains usable in CI and restricted runners."
-        );
     }
 
     // Bubblewrap loads a compiled cBPF program from this inherited file descriptor and
@@ -169,7 +284,7 @@ pub fn exec_sandboxed(
         &executable,
         app_dir.as_deref(),
         writable_dir.as_deref(),
-        network_shared,
+        network_report.effective_mode,
         application_args,
         limits.nproc,
     )?;
@@ -183,13 +298,13 @@ pub fn exec_sandboxed(
         .unwrap_or_else(|| "executable file only".to_owned());
     eprintln!("  App directory  : {app_label}");
     eprintln!(
-        "  Network        : {}",
-        if network_shared {
-            "SHARED (explicit opt-in or host restriction prevents namespace creation)"
-        } else {
-            "isolated by default"
-        }
+        "  Network        : requested={}, effective={}",
+        network_report.requested_mode.as_str(),
+        network_report.effective_mode.as_str()
     );
+    if let Some(reason) = &network_report.fallback_reason {
+        eprintln!("  Fallback reason: {reason}");
+    }
     eprintln!("  Host filesystem: read-only system runtime; host home/runtime sockets hidden");
     let writable_label = writable_dir
         .as_deref()
@@ -657,7 +772,7 @@ fn build_bwrap_args_with_nproc(
     executable: &Path,
     app_dir: Option<&Path>,
     writable_dir: Option<&Path>,
-    share_network: bool,
+    network_mode: SandboxNetworkMode,
     application_args: &[OsString],
     nproc: u64,
 ) -> Result<Vec<OsString>> {
@@ -671,7 +786,7 @@ fn build_bwrap_args_with_nproc(
     push_flag(&mut args, "--unshare-uts");
     push_flag(&mut args, "--cap-drop");
     push_flag(&mut args, "ALL");
-    if !share_network {
+    if network_mode != SandboxNetworkMode::Shared {
         push_flag(&mut args, "--unshare-net");
     }
 
@@ -830,6 +945,7 @@ fn set_env(args: &mut Vec<OsString>, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox_policy::SandboxNetworkMode;
     use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -941,8 +1057,15 @@ mod tests {
             ("developer", "--nproc=512"),
         ] {
             let limits = limits_for_profile(name).unwrap();
-            let args = build_bwrap_args_with_nproc(&exe, None, None, false, &[], limits.nproc)
-                .expect("build sandbox args");
+            let args = build_bwrap_args_with_nproc(
+                &exe,
+                None,
+                None,
+                SandboxNetworkMode::Isolated,
+                &[],
+                limits.nproc,
+            )
+            .expect("build sandbox args");
             assert!(
                 as_strings(&args).contains(&expected.to_owned()),
                 "{name} profile did not set {expected}"
@@ -957,7 +1080,8 @@ mod tests {
         let root = temp_dir("default");
         let exe = executable(&root);
         let args =
-            build_bwrap_args_with_nproc(&exe, None, None, false, &[], 256).expect("build args");
+            build_bwrap_args_with_nproc(&exe, None, None, SandboxNetworkMode::Isolated, &[], 256)
+                .expect("build args");
         let values = as_strings(&args);
         assert!(values.contains(&"--unshare-net".to_owned()));
         assert!(values.contains(&"--unshare-user".to_owned()));
@@ -1004,7 +1128,8 @@ mod tests {
         let root = temp_dir("network");
         let exe = executable(&root);
         let args =
-            build_bwrap_args_with_nproc(&exe, None, None, true, &[], 256).expect("build args");
+            build_bwrap_args_with_nproc(&exe, None, None, SandboxNetworkMode::Shared, &[], 256)
+                .expect("build args");
         assert!(!as_strings(&args).contains(&"--unshare-net".to_owned()));
         fs::remove_dir_all(root).expect("clean fixture");
     }
@@ -1013,8 +1138,15 @@ mod tests {
     fn app_directory_is_mounted_read_only_at_private_sandbox_path() {
         let root = temp_dir("app-dir");
         let exe = executable(&root);
-        let args = build_bwrap_args_with_nproc(&exe, Some(&root), None, false, &[], 256)
-            .expect("build args");
+        let args = build_bwrap_args_with_nproc(
+            &exe,
+            Some(&root),
+            None,
+            SandboxNetworkMode::Isolated,
+            &[],
+            256,
+        )
+        .expect("build args");
         let values = as_strings(&args);
         let root_text = root.to_string_lossy().into_owned();
         assert!(values.windows(3).any(|triple| {
@@ -1039,7 +1171,7 @@ mod tests {
             "bind selected app before hiding its host parent"
         );
         assert!(
-            app_bind_index < tmp_mount_index,
+            app_bind_index < tmp_mask_index,
             "bind selected app before hiding its possible temporary parent"
         );
         assert!(values.contains(&format!("{SANDBOX_APP}/test-app")));
@@ -1095,8 +1227,15 @@ mod tests {
         let root = temp_dir("argv");
         let exe = executable(&root);
         let user_args = vec![OsString::from("semi;colon"), OsString::from("space arg")];
-        let args = build_bwrap_args_with_nproc(&exe, None, None, false, &user_args, 256)
-            .expect("build args");
+        let args = build_bwrap_args_with_nproc(
+            &exe,
+            None,
+            None,
+            SandboxNetworkMode::Isolated,
+            &user_args,
+            256,
+        )
+        .expect("build args");
         let values = as_strings(&args);
         assert!(values.ends_with(&[
             format!("{SANDBOX_APP}/test-app"),
@@ -1178,5 +1317,51 @@ mod tests {
             assert_eq!(x32_check.1, 0, "x32 syscall must fall through");
             assert_eq!(x32_check.2, 1, "native syscalls must skip the kill");
         }
+    }
+}
+
+#[cfg(test)]
+mod network_namespace_probe_tests {
+    use super::*;
+
+    #[test]
+    fn successful_probe_is_supported() {
+        assert_eq!(
+            classify_network_namespace_probe(true, ""),
+            NetworkNamespaceProbe::Supported
+        );
+    }
+
+    #[test]
+    fn recognized_unprivileged_namespace_diagnostic_is_capability_unavailable() {
+        let diagnostic = "bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces.";
+        assert_eq!(
+            classify_network_namespace_probe(false, diagnostic),
+            NetworkNamespaceProbe::CapabilityUnavailable(diagnostic.to_owned())
+        );
+    }
+
+    #[test]
+    fn generic_operation_not_permitted_is_not_a_capability_fallback() {
+        assert_eq!(
+            classify_network_namespace_probe(false, "Operation not permitted"),
+            NetworkNamespaceProbe::Failed("Operation not permitted".to_owned())
+        );
+    }
+
+    #[test]
+    fn unrelated_probe_error_fails_closed() {
+        assert_eq!(
+            classify_network_namespace_probe(false, "bwrap: executable not found"),
+            NetworkNamespaceProbe::Failed("bwrap: executable not found".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_probe_error_fails_closed_with_diagnostic() {
+        assert!(matches!(
+            classify_network_namespace_probe(false, ""),
+            NetworkNamespaceProbe::Failed(message) if message.contains("without a diagnostic")
+        ));
     }
 }

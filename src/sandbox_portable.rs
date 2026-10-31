@@ -1,9 +1,31 @@
 //! Native sandbox launchers for macOS and Windows.
 //! These backends have OS-specific prerequisites and require native testing.
 
+use crate::sandbox_policy::{SandboxNetworkMode, SandboxNetworkReport};
 use anyhow::{bail, Result};
 use std::ffi::OsString;
 use std::path::Path;
+
+fn portable_network_report(requested: SandboxNetworkMode) -> SandboxNetworkReport {
+    let effective = match requested {
+        SandboxNetworkMode::Shared => SandboxNetworkMode::Shared,
+        SandboxNetworkMode::Isolated | SandboxNetworkMode::Automatic => {
+            SandboxNetworkMode::Isolated
+        }
+    };
+    SandboxNetworkReport::new(requested, effective, None)
+}
+
+fn print_portable_network_report(report: &SandboxNetworkReport) {
+    eprintln!(
+        "Network: requested={}, effective={}",
+        report.requested_mode.as_str(),
+        report.effective_mode.as_str()
+    );
+    if let Some(reason) = &report.fallback_reason {
+        eprintln!("Network fallback reason: {reason}");
+    }
+}
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use anyhow::Context;
@@ -53,7 +75,7 @@ pub fn exec_sandboxed(
     executable: &Path,
     app_dir: Option<&Path>,
     writable_dir: Option<&Path>,
-    share_network: bool,
+    network_mode: SandboxNetworkMode,
     application_args: &[OsString],
     profile: &str,
 ) -> Result<()> {
@@ -78,6 +100,8 @@ pub fn exec_sandboxed(
         bail!("executable must be inside the read-only application directory");
     }
     let writable = validate_writable(&app, writable_dir)?;
+    let network_report = portable_network_report(network_mode);
+    let effective_network_mode = network_report.effective_mode;
     let temp = fs::canonicalize(std::env::temp_dir())?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let profile_path = temp.join(format!("qs-{}-{stamp}.sb", std::process::id()));
@@ -94,7 +118,7 @@ pub fn exec_sandboxed(
         .as_deref()
         .map(|p| format!(" (subpath \"{}\")", seatbelt(p)))
         .unwrap_or_default();
-    let network_rule = if share_network {
+    let network_rule = if effective_network_mode == SandboxNetworkMode::Shared {
         "(allow network-outbound)"
     } else {
         ""
@@ -121,14 +145,7 @@ pub fn exec_sandboxed(
     drop(file);
 
     eprintln!("Quantum Shield: macOS Seatbelt sandbox; filesystem writes restricted.");
-    eprintln!(
-        "Network: {}",
-        if share_network {
-            "outbound allowed by opt-in"
-        } else {
-            "denied by default"
-        }
-    );
+    print_portable_network_report(&network_report);
     eprintln!("Note: sandbox-exec is deprecated on macOS and may not be available.");
 
     let result = Command::new("/usr/bin/sandbox-exec")
@@ -155,7 +172,7 @@ pub fn exec_sandboxed(
     executable: &Path,
     app_dir: Option<&Path>,
     writable_dir: Option<&Path>,
-    share_network: bool,
+    network_mode: SandboxNetworkMode,
     application_args: &[OsString],
     profile: &str,
 ) -> Result<()> {
@@ -210,6 +227,8 @@ pub fn exec_sandboxed(
         .strip_prefix(&app)
         .context("executable must be inside the read-only application directory")?;
     let writable = validate_writable(&app, writable_dir)?;
+    let network_report = portable_network_report(network_mode);
+    let effective_network_mode = network_report.effective_mode;
 
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let workdir =
@@ -248,7 +267,11 @@ pub fn exec_sandboxed(
         "<MappedFolder><HostFolder>{}</HostFolder><SandboxFolder>C:\\QSWritable</SandboxFolder><ReadOnly>false</ReadOnly></MappedFolder>",
         xml(&p.to_string_lossy())
     )).unwrap_or_default();
-    let networking = if share_network { "Enable" } else { "Disable" };
+    let networking = if effective_network_mode == SandboxNetworkMode::Shared {
+        "Enable"
+    } else {
+        "Disable"
+    };
     let config = format!(
         r#"<Configuration>
 <Networking>{networking}</Networking>
@@ -278,14 +301,7 @@ pub fn exec_sandboxed(
     eprintln!(
         "App folder is read-only; host output is shared only when --writable-dir is specified."
     );
-    eprintln!(
-        "Network: {}",
-        if share_network {
-            "enabled by explicit opt-in"
-        } else {
-            "disabled"
-        }
-    );
+    print_portable_network_report(&network_report);
     eprintln!(
         "Temporary config retained at {} (remove its folder after closing the sandbox).",
         workdir.display()
@@ -301,7 +317,7 @@ pub fn exec_sandboxed(
     _executable: &Path,
     _app_dir: Option<&Path>,
     _writable_dir: Option<&Path>,
-    _share_network: bool,
+    _network_mode: SandboxNetworkMode,
     _application_args: &[OsString],
     _profile: &str,
 ) -> Result<()> {

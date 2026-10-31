@@ -4,10 +4,14 @@
 //! application, and repository audit commands. Storage/app-payload encryption
 //! remains explicitly incomplete until a matching adapter is implemented.
 
+#[path = "sandbox_policy.rs"]
+mod sandbox_policy;
+
 #[path = "config.rs"]
 mod config;
 
 use eframe::egui::{self, Color32, RichText};
+use sandbox_policy::SandboxNetworkMode;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -142,7 +146,7 @@ struct DesktopApp {
     sandbox_app_dir: String,
     sandbox_writable_dir: String,
     sandbox_args: String,
-    sandbox_share_network: bool,
+    sandbox_network_mode: SandboxNetworkMode,
     sandbox_running: bool,
     sandbox_message: Option<AuditEvent>,
     sandbox_tx: Sender<AuditEvent>,
@@ -204,7 +208,7 @@ impl Default for DesktopApp {
             sandbox_app_dir: String::new(),
             sandbox_writable_dir: String::new(),
             sandbox_args: String::new(),
-            sandbox_share_network: false,
+            sandbox_network_mode: SandboxNetworkMode::Isolated,
             sandbox_running: false,
             sandbox_message: None,
             sandbox_tx,
@@ -666,7 +670,13 @@ impl eframe::App for DesktopApp {
                 ui.add(egui::TextEdit::multiline(&mut self.sandbox_args)
                     .desired_width(f32::INFINITY)
                     .desired_rows(3));
-                ui.checkbox(&mut self.sandbox_share_network, "Share host networking (reduces isolation; only enable when required)");
+                egui::ComboBox::from_label("Network policy")
+                    .selected_text(self.sandbox_network_mode.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.sandbox_network_mode, SandboxNetworkMode::Isolated, "Isolated (default)");
+                        ui.selectable_value(&mut self.sandbox_network_mode, SandboxNetworkMode::Shared, "Shared (host networking)");
+                        ui.selectable_value(&mut self.sandbox_network_mode, SandboxNetworkMode::Automatic, "Automatic (warns on capability fallback)");
+                    });
                 let can_launch = !self.sandbox_executable.trim().is_empty() && !self.sandbox_running;
                 if ui.add_enabled(can_launch, egui::Button::new("Run CLI task in Software Shield →")).clicked() {
                     self.sandbox_message = None;
@@ -675,7 +685,7 @@ impl eframe::App for DesktopApp {
                             let executable = self.sandbox_executable.trim().to_owned();
                             let app_dir = self.sandbox_app_dir.trim().to_owned();
                             let writable_dir = self.sandbox_writable_dir.trim().to_owned();
-                            let share_network = self.sandbox_share_network;
+                            let network_mode = self.sandbox_network_mode;
                             let app_args = self.sandbox_args.lines().filter(|line| !line.is_empty()).map(OsString::from).collect::<Vec<_>>();
                             let tx = self.sandbox_tx.clone();
                             self.sandbox_running = true;
@@ -689,9 +699,7 @@ impl eframe::App for DesktopApp {
                                 if !writable_dir.is_empty() {
                                     command.arg("--writable-dir").arg(&writable_dir);
                                 }
-                                if share_network {
-                                    command.arg("--share-network");
-                                }
+                                command.arg("--network-mode").arg(network_mode.as_str());
                                 if !app_args.is_empty() {
                                     command.arg("--").args(app_args);
                                 }

@@ -16,10 +16,13 @@ mod sandbox;
 #[cfg(not(target_os = "linux"))]
 #[path = "sandbox_portable.rs"]
 mod sandbox;
+#[path = "sandbox_policy.rs"]
+mod sandbox_policy;
 mod security;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use sandbox_policy::{resolve_network_mode, SandboxNetworkMode};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
@@ -243,9 +246,12 @@ enum Commands {
         /// Explicit host directory mounted writable inside the sandbox. Must not overlap the app/executable.
         #[arg(long)]
         writable_dir: Option<PathBuf>,
-        /// Explicitly share the host network namespace. Use only for software that needs network access.
-        #[arg(long)]
+        /// Explicitly share the host network namespace (legacy; prefer --network-mode shared).
+        #[arg(long, conflicts_with = "network_mode")]
         share_network: bool,
+        /// Network policy: isolated (default), shared, or automatic.
+        #[arg(long, value_enum, conflicts_with = "share_network")]
+        network_mode: Option<SandboxNetworkMode>,
         /// Resource profile: strict, balanced (default), or developer.
         #[arg(long, value_parser = ["strict", "balanced", "developer"], default_value = "balanced")]
         profile: String,
@@ -653,14 +659,16 @@ async fn run() -> Result<()> {
             app_dir,
             writable_dir,
             share_network,
+            network_mode,
             profile,
             args,
         } => {
+            let network_mode = resolve_network_mode(network_mode, share_network)?;
             sandbox::exec_sandboxed(
                 &executable,
                 app_dir.as_deref(),
                 writable_dir.as_deref(),
-                share_network,
+                network_mode,
                 &args,
                 &profile,
             )?;
@@ -1316,5 +1324,58 @@ mod domain_proof_tests {
             verified_at: None,
         };
         assert!(!is_recent_domain_proof(&unverified_record, now));
+    }
+}
+
+#[cfg(test)]
+mod sandbox_network_cli_tests {
+    use super::*;
+
+    fn parse_sandbox_run(extra: &[&str]) -> Result<Commands, clap::Error> {
+        let mut args = vec!["qsctl", "sandbox-run", "/bin/true"];
+        args.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(args)?;
+        Ok(cli.command)
+    }
+
+    #[test]
+    fn legacy_share_network_flag_is_accepted() {
+        match parse_sandbox_run(&["--share-network"]).unwrap() {
+            Commands::SandboxRun {
+                share_network,
+                network_mode,
+                ..
+            } => {
+                assert!(share_network);
+                assert_eq!(network_mode, None);
+            }
+            _ => panic!("expected sandbox-run command"),
+        }
+    }
+
+    #[test]
+    fn explicit_network_modes_are_accepted() {
+        for (mode, expected) in [
+            ("isolated", SandboxNetworkMode::Isolated),
+            ("shared", SandboxNetworkMode::Shared),
+            ("automatic", SandboxNetworkMode::Automatic),
+        ] {
+            match parse_sandbox_run(&["--network-mode", mode]).unwrap() {
+                Commands::SandboxRun {
+                    share_network,
+                    network_mode,
+                    ..
+                } => {
+                    assert!(!share_network);
+                    assert_eq!(network_mode, Some(expected));
+                }
+                _ => panic!("expected sandbox-run command"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_and_explicit_network_options_conflict() {
+        assert!(parse_sandbox_run(&["--share-network", "--network-mode", "shared"]).is_err());
     }
 }

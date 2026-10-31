@@ -122,9 +122,9 @@ All three commands support `--json`, `--output PATH`, and `--fail-on-findings`. 
 - Universal installation adapters for all hosting providers, website builders and application stacks. Initial live apply is Docker Compose only.
 - WebSocket tunneling, HTTP/2, per-client rate limiting, a WAF, bot defense, or distributed DDoS mitigation.
 - An independent security audit, signed release pipeline, or a guarantee of zero downtime/zero defects.
-- Full SAST/data-flow analysis, Git-history secret scanning, authenticated DAST/crawling, full system-wide runtime instrumentation, application-specific seccomp profiles/resource quotas, GUI-session sandboxing, or universal support for every language/platform.
+- Full SAST/data-flow analysis, Git-history secret scanning, authenticated DAST/crawling, full system-wide runtime instrumentation, application-specific seccomp allowlists, GUI-session sandboxing, or universal support for every language/platform.
 
-The GUI allows requesting additional layers, and RC2 includes a Software Shield baseline-sandbox panel for non-interactive Linux CLI tasks. That profile drops capabilities, remounts the sandbox root read-only, hides host home/runtime paths, isolates networking by default and allows only one explicitly selected host output directory to remain writable. It is a baseline containment profile, not a universal application shield: GUI apps, syscall allowlists, CPU/memory/process quotas and runtime-specific compatibility policies are not yet implemented. Selected storage/payload layers remain **not applied** unless a future platform-specific adapter performs and verifies them.
+The GUI allows requesting additional layers, and RC2 includes a Software Shield baseline-sandbox panel for non-interactive Linux CLI tasks. That profile drops capabilities, remounts the sandbox root read-only, hides host home/runtime paths, isolates networking by default and allows only one explicitly selected host output directory to remain writable. It is a baseline containment profile, not a universal application shield: GUI apps, application-specific syscall allowlists, memory limits, and runtime-specific compatibility policies are not yet implemented. The Linux profile does enforce kernel CPU-time, address-space, file-size, open-file, process-count, and core-dump limits. Selected storage/payload layers remain **not applied** unless a future platform-specific adapter performs and verifies them.
 
 ## Build gate on Linux
 
@@ -286,7 +286,7 @@ Website mode requires a valid site configuration and certificate/key files.
 Hybrid X25519MLKEM768 key exchange is active only when supported and actually
 negotiated. Repository checks distinguish unavailable commands/tools from clean
 results. Software mode uses the existing Bubblewrap CLI profile, and fails
-closed if required sandbox features are unavailable.
+closed if required sandbox features are unavailable. Network policy defaults to `isolated`; `shared` explicitly enables host networking; `automatic` prefers isolation and, on Linux only, falls back to shared networking for a narrowly recognized unprivileged-user-namespace capability restriction. Other probe failures remain fail-closed.
 
 This launcher is a CLI onboarding layer. It does not claim universal
 application compatibility or that all modes provide identical encryption.

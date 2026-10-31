@@ -57,14 +57,40 @@ grep -Fq 'QS_ROOT_READONLY' <<<"$ROOT_OUT" || { printf '%s\n' "$ROOT_OUT" >&2; e
 echo "PASS: unbound root filesystem is read-only."
 
 echo
-echo "=== PID and network namespace isolation ==="
+echo "=== Mandatory PID namespace isolation ==="
 HOST_PID_NS="$(readlink /proc/self/ns/pid)"
-HOST_NET_NS="$(readlink /proc/self/ns/net)"
 CHILD_PID_NS="$("$QSCTL" sandbox-run "$SH" -- -c 'readlink /proc/self/ns/pid' qs-test)"
-CHILD_NET_NS="$("$QSCTL" sandbox-run "$SH" -- -c 'readlink /proc/self/ns/net' qs-test)"
-[[ "$HOST_PID_NS" != "$CHILD_PID_NS" ]] || { echo "FAIL: PID namespace was not isolated." >&2; exit 1; }
-[[ "$HOST_NET_NS" != "$CHILD_NET_NS" ]] || { echo "FAIL: network namespace was not isolated by default." >&2; exit 1; }
-echo "PASS: PID and network namespaces differ from the host by default."
+[[ "$HOST_PID_NS" != "$CHILD_PID_NS" ]] || {
+  echo "FAIL: PID namespace was not isolated." >&2
+  exit 1
+}
+echo "PASS: PID namespace differs from the host."
+
+echo
+echo "=== Network namespace isolation (capability-dependent) ==="
+HOST_NET_NS="$(readlink /proc/self/ns/net)"
+if NET_OUT="$("$QSCTL" sandbox-run "$SH" -- -c 'readlink /proc/self/ns/net' qs-test 2>&1)"; then
+  CHILD_NET_NS="$(printf '%s\n' "$NET_OUT" | grep -Eo 'net:\[[0-9]+\]' | tail -n 1)"
+  [[ -n "$CHILD_NET_NS" ]] || {
+    printf '%s\n' "$NET_OUT" >&2
+    echo "FAIL: could not read child network namespace." >&2
+    exit 1
+  }
+  [[ "$HOST_NET_NS" != "$CHILD_NET_NS" ]] || {
+    echo "FAIL: network namespace was not isolated by default." >&2
+    exit 1
+  }
+  echo "PASS: network namespace differs from the host."
+else
+  if grep -qiF 'no permissions to create a new namespace' <<<"$NET_OUT" &&
+     grep -qiF 'non-privileged user namespaces' <<<"$NET_OUT"; then
+    echo "SKIP: host lacks the recognized unprivileged network namespace capability."
+  else
+    printf '%s\n' "$NET_OUT" >&2
+    echo "FAIL: network namespace probe failed for an unexpected reason." >&2
+    exit 1
+  fi
+fi
 
 # QS_EFFECTIVE_RLIMITS_CHECK
 echo
