@@ -55,7 +55,7 @@ tower-service = "0.3.3"
 tls-hot-reload = { version = "=0.4.0", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
 prometheus = { version = "0.14", optional = true }
-zenitnel-modsec = "=0.5.0"
+zentinel-modsec = "=0.5.0"
 
 [profile.release]
 opt-level = "z"
