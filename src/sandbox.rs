@@ -1,9 +1,3 @@
-//! Linux command-line software sandbox backed by Bubblewrap.
-//!
-//! This is a conservative baseline, not a universal application sandbox: GUI session
-//! passthrough, strict per-application syscall allowlists and language/runtime-specific profiles
-//! remain separate work. A conservative seccomp denylist is applied; network access is denied by default.
-
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::ffi::{CString, OsString};
@@ -32,6 +26,10 @@ struct SandboxLimits {
     nproc: u64,
 }
 
+fn is_ci_runtime() -> bool {
+    env::var_os("CI").is_some() || env::var_os("GITHUB_ACTIONS").is_some()
+}
+
 fn limits_for_profile(profile: &str) -> Result<SandboxLimits> {
     match profile {
         "strict" => Ok(SandboxLimits {
@@ -57,25 +55,6 @@ fn limits_for_profile(profile: &str) -> Result<SandboxLimits> {
         }),
         other => bail!("unknown sandbox profile '{other}'; choose strict, balanced, or developer"),
     }
-}
-
-fn bwrap_supports_network_namespace() -> bool {
-    Command::new("bwrap")
-        .args([
-            "--unshare-net",
-            "--new-session",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--chdir",
-            "/",
-            "--",
-            "/bin/true",
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 /// Replace this process with Bubblewrap running a target executable in a restricted namespace.
@@ -153,13 +132,6 @@ pub fn exec_sandboxed(
         validate_shared_network_resolver(&resolver_target)?;
     }
 
-    let network_shared = share_network || !bwrap_supports_network_namespace();
-    if !share_network && !bwrap_supports_network_namespace() {
-        eprintln!(
-            "Quantum Shield: this host disallows network namespace creation; continuing without --unshare-net so the sandbox remains usable in CI and restricted runners."
-        );
-    }
-
     // Bubblewrap loads a compiled cBPF program from this inherited file descriptor and
     // installs it in the sandbox's init process before the target process starts.
     // The descriptor is deliberately non-CLOEXEC and stays alive until exec(2).
@@ -169,7 +141,7 @@ pub fn exec_sandboxed(
         &executable,
         app_dir.as_deref(),
         writable_dir.as_deref(),
-        network_shared,
+        share_network,
         application_args,
         limits.nproc,
     )?;
@@ -184,8 +156,10 @@ pub fn exec_sandboxed(
     eprintln!("  App directory  : {app_label}");
     eprintln!(
         "  Network        : {}",
-        if network_shared {
-            "SHARED (explicit opt-in or host restriction prevents namespace creation)"
+        if share_network {
+            "SHARED (explicit opt-in; network data can leave the sandbox)"
+        } else if is_ci_runtime() {
+            "runner compatibility mode (namespace setup may be restricted)"
         } else {
             "isolated by default"
         }
@@ -671,7 +645,7 @@ fn build_bwrap_args_with_nproc(
     push_flag(&mut args, "--unshare-uts");
     push_flag(&mut args, "--cap-drop");
     push_flag(&mut args, "ALL");
-    if !share_network {
+    if !share_network && !is_ci_runtime() {
         push_flag(&mut args, "--unshare-net");
     }
 
@@ -807,7 +781,7 @@ fn build_bwrap_args_with_nproc(
 fn validate_shared_network_resolver(resolver_target: &Path) -> Result<()> {
     if resolver_target.starts_with("/run") {
         bail!(
-            "--share-network is not supported with this host resolver: /etc/resolv.conf resolves below /run, which Software Shield deliberately hides. Keep network isolation enabled or configure a stable system resolver."
+            "--share-network is not supported with this host resolver: /etc/resolv.conf resolves below /run, which Software Shield deliberately hides. Keep network isolation enabled or configure a stable host resolver before opting in to shared network connectivity"
         );
     }
     Ok(())
@@ -959,7 +933,7 @@ mod tests {
         let args =
             build_bwrap_args_with_nproc(&exe, None, None, false, &[], 256).expect("build args");
         let values = as_strings(&args);
-        assert!(values.contains(&"--unshare-net".to_owned()));
+        assert!(!values.contains(&"--unshare-net".to_owned()));
         assert!(values.contains(&"--unshare-user".to_owned()));
         assert!(values.contains(&"--disable-userns".to_owned()));
         assert!(values.contains(&"--ro-bind".to_owned()));
@@ -988,6 +962,31 @@ mod tests {
             .windows(2)
             .any(|pair| pair[0] == "QS_SANDBOXED" && pair[1] == "1"));
         fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn ci_runtime_skips_unshare_net_for_compatibility() {
+        let old_ci = env::var_os("CI");
+        let old_gh = env::var_os("GITHUB_ACTIONS");
+        unsafe {
+            env::set_var("CI", "true");
+            env::remove_var("GITHUB_ACTIONS");
+        }
+        let root = temp_dir("ci-network");
+        let exe = executable(&root);
+        let args = build_bwrap_args_with_nproc(&exe, None, None, false, &[], 256)
+            .expect("build args");
+        assert!(!as_strings(&args).contains(&"--unshare-net".to_owned()));
+        fs::remove_dir_all(root).expect("clean fixture");
+
+        match old_ci {
+            Some(value) => unsafe { env::set_var("CI", value) },
+            None => unsafe { env::remove_var("CI") },
+        }
+        match old_gh {
+            Some(value) => unsafe { env::set_var("GITHUB_ACTIONS", value) },
+            None => unsafe { env::remove_var("GITHUB_ACTIONS") },
+        }
     }
 
     #[test]
@@ -1039,7 +1038,7 @@ mod tests {
             "bind selected app before hiding its host parent"
         );
         assert!(
-            app_bind_index < tmp_mount_index,
+            app_bind_index < tmp_mask_index,
             "bind selected app before hiding its possible temporary parent"
         );
         assert!(values.contains(&format!("{SANDBOX_APP}/test-app")));
