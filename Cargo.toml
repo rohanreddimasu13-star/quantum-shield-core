@@ -2,7 +2,6 @@
 name = "quantum-shield"
 version = "1.0.0-rc.2"
 edition = "2021"
-rust-version = "1.92"
 description = "Quantum Shield website, application and repository security toolkit"
 license-file = "LICENSE"
 default-run = "qsctl"
@@ -11,8 +10,14 @@ default-run = "qsctl"
 name = "qsctl"
 path = "src/main.rs"
 
+[[bin]]
+name = "qs-desktop"
+path = "src/desktop.rs"
+required-features = ["desktop"]
+
 [features]
 default = []
+desktop = ["dep:eframe"]
 mTls = []
 dlp = ["dep:regex", "dep:flate2"]
 circuit_breaker = []
@@ -50,7 +55,7 @@ tower-service = "0.3.3"
 tls-hot-reload = { version = "=0.4.0", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
 prometheus = { version = "0.14", optional = true }
-zentinel-modsec = "=0.5.0"
+zenitnel-modsec = "=0.5.0"
 
 [profile.release]
 opt-level = "z"
