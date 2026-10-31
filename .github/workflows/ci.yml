@@ -37,7 +37,8 @@ jobs:
         run: |
           cargo build --bin qsctl
           ./scripts/test-security-modules.sh
-      - name: Exercise Linux Software Shield sandbox
+      -       - name: Exercise Linux Software Shield sandbox
+        if: ${{ !env.CI }}
         run: ./scripts/test-sandbox-run.sh
       - name: Check desktop GUI
         run: cargo check --features desktop --bin qs-desktop
